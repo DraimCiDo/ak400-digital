@@ -1,0 +1,196 @@
+#!/usr/bin/env python3
+"""DeepCool AK400 DIGITAL display driver (USB 3633:0001).
+
+This unit's firmware resets when its HID IN endpoint is polled (which usbhid
+does whenever /dev/hidrawN is open). So we detach usbhid and write reports
+straight to interrupt OUT endpoint 0x01 via usbfs, never touching IN.
+
+Usage: ak400-display [temp|usage|auto|all] [interval_seconds]
+  temp   CPU temperature
+  usage  CPU load
+  auto   CPU temp <-> CPU load every 4 s
+  all    CPU temp -> CPU load -> "---" -> GPU temp -> GPU load, 4 s each
+The load bar always shows the load of the device currently displayed.
+
+Packet layout (64 bytes): [16, icon, bar, d1, d2, d3, alarm, 0...]
+  icon: 19 TEMP °C, 35 TEMP °F, 76 USAGE %, 170 bar-fill animation,
+        255 all segments, anything else = blank (scanned 0..255)
+  bar: 0..10; digits: 0-9, 10 = blank, 12 = '-'
+  alarm: 1 blink TEMP+digits, 2 hide TEMP and blink digits
+"""
+import os, sys, glob, time, fcntl, struct, ctypes
+
+VID, PID = '3633', '0001'
+USBDEVFS_IOCTL, USBDEVFS_DISCONNECT = 0xC0105512, 0x5516
+USBDEVFS_CLAIMINTERFACE, USBDEVFS_BULK = 0x8004550F, 0xC0185502
+ICON_TEMP, ICON_USAGE = 19, 76
+ICON_INTRO, INTRO_TIME = 170, 3.0  # bar-fill animation (official "init" packet)
+BLANK, DASH = 10, 12
+TEMP_ALARM = 90
+PHASE = 4.0  # seconds per screen in auto/all modes
+REFRESH = 30.0  # resend an unchanged frame at most this often
+
+
+# ---------- USB ----------
+def find_dev():
+    for d in glob.glob('/sys/bus/usb/devices/*'):
+        try:
+            if open(d + '/idVendor').read().strip() == VID and open(d + '/idProduct').read().strip() == PID:
+                return '/dev/bus/usb/%03d/%03d' % (int(open(d + '/busnum').read()), int(open(d + '/devnum').read()))
+        except OSError:
+            pass
+
+
+def open_dev():
+    path = find_dev()
+    if not path:
+        return None
+    fd = os.open(path, os.O_RDWR)
+    try:
+        fcntl.ioctl(fd, USBDEVFS_IOCTL, struct.pack('iiP', 0, USBDEVFS_DISCONNECT, 0))
+    except OSError:
+        pass  # no kernel driver bound
+    fcntl.ioctl(fd, USBDEVFS_CLAIMINTERFACE, struct.pack('I', 0))
+    return fd
+
+
+def usb_write(fd, data):
+    buf = ctypes.create_string_buffer(data, len(data))
+    fcntl.ioctl(fd, USBDEVFS_BULK, struct.pack('IIIxxxxP', 0x01, len(data), 1000, ctypes.addressof(buf)))
+
+
+# ---------- sensors ----------
+def cpu_temp():
+    for h in glob.glob('/sys/class/hwmon/hwmon*'):
+        try:
+            if open(h + '/name').read().strip() in ('k10temp', 'coretemp', 'zenpower'):
+                return int(open(h + '/temp1_input').read()) // 1000
+        except OSError:
+            pass
+    return 0
+
+
+class CpuLoad:
+    def __init__(self):
+        self.prev = self._stat()
+
+    @staticmethod
+    def _stat():
+        v = list(map(int, open('/proc/stat').readline().split()[1:]))
+        return sum(v), v[3] + v[4]
+
+    def read(self):
+        cur = self._stat()
+        dt = cur[0] - self.prev[0]
+        load = round(100 * (1 - (cur[1] - self.prev[1]) / dt)) if dt else 0
+        self.prev = cur
+        return load
+
+
+class NvidiaGpu:
+    """Minimal NVML binding; .ok is False if no NVIDIA GPU/driver."""
+    def __init__(self):
+        self.ok = False
+        try:
+            self.nvml = ctypes.CDLL('libnvidia-ml.so.1')
+            if self.nvml.nvmlInit_v2() != 0:
+                return
+            self.handle = ctypes.c_void_p()
+            if self.nvml.nvmlDeviceGetHandleByIndex_v2(0, ctypes.byref(self.handle)) != 0:
+                return
+            self.ok = True
+        except OSError:
+            pass
+
+    def temp(self):
+        t = ctypes.c_uint()
+        self.nvml.nvmlDeviceGetTemperature(self.handle, 0, ctypes.byref(t))
+        return t.value
+
+    def load(self):
+        u = (ctypes.c_uint * 2)()
+        self.nvml.nvmlDeviceGetUtilizationRates(self.handle, ctypes.byref(u))
+        return u[0]
+
+
+# ---------- display ----------
+def bar_for(load):
+    return 1 if load < 15 else min(10, round(load / 10))
+
+
+def number_frame(icon, value, load, alarm=0):
+    v = max(0, min(999, value))
+    d = [v // 100, v % 100 // 10, v % 10]
+    if d[0] == 0:
+        d[0] = BLANK
+        if d[1] == 0:
+            d[1] = BLANK
+    return bytes([16, icon, bar_for(load), d[0], d[1], d[2], alarm] + [0] * 57)
+
+
+def dash_frame():
+    return bytes([16, ICON_TEMP, 0, DASH, DASH, DASH, 2] + [0] * 57)
+
+
+def main():
+    mode = sys.argv[1] if len(sys.argv) > 1 else 'temp'
+    interval = float(sys.argv[2]) if len(sys.argv) > 2 else 1.0
+    if mode not in ('temp', 'usage', 'auto', 'all'):
+        sys.exit(__doc__)
+    cpu = CpuLoad()
+    gpu = NvidiaGpu() if mode == 'all' else None
+    if mode == 'all' and not gpu.ok:
+        mode = 'auto'
+    screens = {'temp': ['ct'], 'usage': ['cu'], 'auto': ['ct', 'cu'],
+               'all': ['ct', 'cu', 'gt', 'gu']}[mode]
+    fd, t0, step = None, time.time(), min(interval, 0.5)
+    last_sample, cl, ct, gl, gt = 0, 0, 0, 0, 0
+    intro_done = '--no-intro' in sys.argv
+    last_pkt, last_write = None, 0.0
+    while True:
+        time.sleep(step)
+        now = time.time()
+        if now - last_sample >= interval:
+            cl, ct = cpu.read(), cpu_temp()
+            if gpu:
+                gl, gt = gpu.load(), gpu.temp()
+            last_sample = now
+        elapsed = now - t0
+        scr = screens[int(elapsed // PHASE) % len(screens)]
+        in_phase = elapsed % PHASE
+        if scr == 'gt' and in_phase < 0.7:
+            pkt = dash_frame()                       # separator before GPU screens
+        elif scr == 'ct':
+            pkt = number_frame(ICON_TEMP, ct, cl, 1 if ct >= TEMP_ALARM else 0)
+        elif scr == 'cu':
+            pkt = number_frame(ICON_USAGE, cl, cl)
+        elif scr == 'gt':
+            pkt = number_frame(ICON_TEMP, gt, gl, 1 if gt >= TEMP_ALARM else 0)
+        else:
+            pkt = number_frame(ICON_USAGE, gl, gl)
+        # The display latches the last frame, and every write risks a firmware
+        # reset, so only send when the picture changes (plus a rare refresh).
+        if pkt == last_pkt and now - last_write < REFRESH:
+            continue
+        try:
+            if fd is None:
+                fd = open_dev()
+                if fd is None:
+                    continue
+                if not intro_done:                   # icon 170 = bar fill animation
+                    usb_write(fd, bytes([16, ICON_INTRO] + [0] * 62))
+                    intro_done = True
+                    time.sleep(INTRO_TIME)
+            usb_write(fd, pkt)
+            last_pkt, last_write = pkt, now
+        except OSError:
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+            fd = None
+
+
+if __name__ == '__main__':
+    main()

@@ -1,0 +1,11 @@
+[Unit]
+Description=DeepCool AK400 ARGB effect via OpenRGB (Gigabyte RGB Fusion 2, D_LED2)
+After=multi-user.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/openrgb --noautoconnect -d 0 -m "Color Cycle" -s 50
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
