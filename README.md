@@ -25,7 +25,7 @@ and [deepcool-digital-linux](https://github.com/Nortank12/deepcool-digital-linux
 |---|---|
 | hidraw held open (official app / hidapi) | 6 in 40 s |
 | hidraw open → write → close each update | 1 in 90 s |
-| usbfs, usbhid detached, OUT endpoint only | ~0–1 per several minutes |
+| usbfs, usbhid detached, OUT endpoint only, write on change | 2 in 15 min (auto-recovers in ~1 s) |
 
 ## The fix
 
