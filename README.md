@@ -1,8 +1,11 @@
 # ak400-digital-linux
 
-Linux driver for the **DeepCool AK400 DIGITAL** CPU cooler display (USB `3633:0001`),
+Display driver for the **DeepCool AK400 DIGITAL** CPU cooler (USB `3633:0001`),
 written for units whose display **keeps disconnecting / never works** with the official
 software and with existing open-source drivers.
+
+- **Linux** · Follow the [Linux installation instructions](#install).
+- **Windows 11 x64** · See the [Windows guide](windows/README.md) for WinUSB, the display probe and boot startup.
 
 *Русская версия — [ниже](#по-русски).*
 
@@ -36,7 +39,7 @@ and [deepcool-digital-linux](https://github.com/Nortank12/deepcool-digital-linux
   and crash it.
 - It recovers automatically within about a second if the cooler still resets.
 
-Pure Python 3 standard library, no dependencies (NVIDIA GPU stats via `libnvidia-ml` if present).
+The Linux implementation uses the Python 3 standard library (NVIDIA GPU stats via `libnvidia-ml` if present).
 
 ## Install
 
@@ -96,7 +99,7 @@ which applies Color Cycle at boot. Edit the `-m` / `-d` arguments for your board
 
 ## По-русски
 
-Драйвер дисплея кулера **DeepCool AK400 DIGITAL** для Linux.
+Драйвер дисплея кулера **DeepCool AK400 DIGITAL**. Ниже описана Linux-версия. Для Windows 11 см. [сборку, проверку дисплея и автозапуск](windows/README.md).
 
 **Проблема:** на некоторых экземплярах дисплей не работает ни с официальным софтом, ни с
 открытыми драйверами. Кулер переподключается по USB каждые несколько секунд. Причина: прошивка
